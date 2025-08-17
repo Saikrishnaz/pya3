@@ -11,7 +11,7 @@ import os
 import websocket
 import rel
 import ssl
-
+import signal,sys
 import threading
 
 logger = logging.getLogger(__name__)
@@ -157,6 +157,17 @@ class Aliceblue:
         self.__on_disconnect = None
         self.__on_open = None
         self.__exchange_codes = None
+        self._on_message_callback = None
+        self.stop_flag = False
+        self._retry_delay = 3   # initial retry delay (seconds)
+
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, sig, frame):
+        print("Ctrl+C or termination signal received, stopping WebSocket...")
+        self.stop()
+        exit(0)
 
     def _get(self, sub_url, data=None):
         """Get method declaration"""
@@ -923,24 +934,22 @@ class Aliceblue:
         parse_data = response.json()
         websocket_Token = parse_data['result'][0]['orderToken']
         return websocket_Token
+    
+    # ====== Order Status Feed updated by saikrishnaz-commits======
 
-    def connect_webcoscket(self, userid):
+    def connect_webcoscket(self):
 
         ws_token = self.create_websocket_token()
-        print("WebSocket connection established.")
-        headers = {
-            'Content-Type': 'application/json'
-        }
-        payload = {
-            "orderToken": ws_token,
-            "userId": userid
-        }
+        print("WebSocket connection established. = ",ws_token)
+        payload = {"orderToken": ws_token, "userId": self.user_id}
         session_data = json.dumps(payload)
 
         def on_message(ws, message):
-            print(message)
+            if self._on_message_callback:
+                self._on_message_callback(message)
 
         def on_error(ws, error):
+            print(f"Order WS error: {error}")
             if type(ws) is not websocket.WebSocketApp:
                 error = ws
             if self.__on_error:
@@ -951,22 +960,27 @@ class Aliceblue:
             if self.__on_disconnect:
                 self.__on_disconnect()
             print(f"WebSocket Closed. Status code: {close_status_code}, Reason: {close_msg}")
+            if not self.stop_flag:
+                self.retry_connection()
+
 
         def on_open(ws):
+            self.ws_connection = True
             print("WebSocket Connection Opened")
+            self._retry_delay = 3  # reset backoff after successful connect
             ws.send(session_data)
+            
             threading.Thread(target=heart_beat_connection, args=(ws,), daemon=True).start()
 
         def heart_beat_connection(ws):
-            heartbeat_Flag = True
-            while heartbeat_Flag:
-                payload = {
-                    "heartbeat": "h",
-                    "userId": userid
-                }
-                hearbeat_data = json.dumps(payload)
-                ws.send(hearbeat_data)
-                time.sleep(55)
+            while not self.stop_flag and self.ws_connection:
+                try:
+                    payload = {"heartbeat": "h", "userId": self.user_id}
+                    ws.send(json.dumps(payload))
+                except Exception as e:
+                    print(f"Heartbeat failed: {e}")
+                    break
+                sleep(50)
 
         # Create the WebSocket connection
         ws = websocket.WebSocketApp(
@@ -975,9 +989,30 @@ class Aliceblue:
             on_error=on_error,
             on_close=on_close,
             on_open=on_open,
-            header=headers  # Pass headers if required
+            header={'Content-Type': 'application/json'}  # Pass headers if required
         )
-        ws.run_forever()
+        try:
+            ws.run_forever(ping_interval=30, ping_timeout=10)
+        except Exception as e:
+            print(f"run_forever error: {e}")
+            if not self.stop_flag:
+                self.retry_connection()
+
+    def retry_connection(self):
+        """Reconnect with delay if not stopped"""
+        if not self.stop_flag:
+            sleep(self._retry_delay)
+            self._retry_delay = min(self._retry_delay * 2, 60)
+            self.connect_webcoscket()
+        else:
+            print(" Stop flag set → not reconnecting")
+
+
+
+    def stop(self):
+        """Graceful stop of WebSocket"""
+        self.stop_flag = True
+        self.ws_connection = False
 
 
 class Alice_Wrapper():
